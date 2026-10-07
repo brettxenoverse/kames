@@ -312,7 +312,7 @@ function KP_IsMultiAbilitySuppressed()
         tick() <= _kpEnv.KP_Runtime.suppressMacroMultiAbilityUntil
 end
 
-KP.cleanup = function()
+KP.cleanup = function(teleporting)
     if not KP.alive then return end
     if KP.flushMacros then pcall(KP.flushMacros) end
     KP.alive = false
@@ -325,8 +325,22 @@ KP.cleanup = function()
     for _, context in pairs(KP.features) do KP.CancelContext(context) end
     for conn in pairs(KP.connections) do pcall(function() conn:Disconnect() end) end
     KP.connections = {}
-    for _, name in ipairs({"restoreMap", "restoreSimplifiedEnemies", "restoreDestroyedVisuals", "restoreFPS", "restoreAnonymous", "restoreNameColor", "flushMapStats", "restoreLevelSpoof", "restoreRendering", "restorePriorityHook", "cleanupAutoPlacement"}) do
-        if KP[name] then pcall(KP[name]) end
+    local restoreOnExit = {"restoreMap", "restoreSimplifiedEnemies", "restoreDestroyedVisuals", "restoreFPS", "restoreAnonymous", "restoreNameColor", "flushMapStats", "restoreLevelSpoof", "restoreRendering", "restorePriorityHook", "cleanupAutoPlacement"}
+    KP.teleportRestore = {}
+    for _, name in ipairs(restoreOnExit) do
+        if KP[name] then
+            if teleporting and name ~= "restorePriorityHook" and name ~= "cleanupAutoPlacement" and name ~= "flushMapStats" then
+                table.insert(KP.teleportRestore, name)
+            else
+                pcall(KP[name])
+            end
+        end
+    end
+    KP.restoreAfterFailedTeleport = function()
+        for _, name in ipairs(KP.teleportRestore or {}) do
+            if KP[name] then pcall(KP[name]) end
+        end
+        KP.teleportRestore = {}
     end
     if KP.ui then pcall(function() KP.ui:Destroy() end) end
     if KP.enemyOverlayFolder then pcall(function() KP.enemyOverlayFolder:Destroy() end) end
@@ -1993,6 +2007,7 @@ local function BindAutoExecute()
     end
     local function restoreAfterFailure()
         if _kpEnv.KP_Runtime~=KP then return end
+        if KP.restoreAfterFailedTeleport then pcall(KP.restoreAfterFailedTeleport) end
         local ok,err=pcall(function()
             local saved=readfile(KP.runtimeSourcePath)
             local fn,compileError=loadstring(saved,"KarmaPanda:X teleport recovery")
@@ -2023,10 +2038,11 @@ local function BindAutoExecute()
             end)
             _kpEnv.KP_TeleportFailureConnection=failureConnection
         end
-        task.defer(function()
-            if KP.alive and not teleportFailed then KP.cleanup()end
-            if teleportFailed then disconnectFailure()end
-        end)
+        if not teleportFailed and KP.alive then
+            local ok,err=pcall(KP.cleanup,true)
+            if not ok then KP.Report("Teleport cleanup",err) end
+        end
+        if teleportFailed then disconnectFailure()end
     end))
 end
 
