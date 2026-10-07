@@ -4,6 +4,10 @@ local _waitStart = tick()
 repeat task.wait(0.5) until game.GameId == 1720936166 or game.PlaceId == 4996049426 or tick() - _waitStart > 15
 if game.GameId ~= 1720936166 and game.PlaceId ~= 4996049426 then return end
 local _kpEnv = getgenv()
+if _kpEnv.KP_TeleportFailureConnection then
+    pcall(function()_kpEnv.KP_TeleportFailureConnection:Disconnect()end)
+    _kpEnv.KP_TeleportFailureConnection=nil
+end
 local _kpSessionId = tostring(game.JobId) .. ":" .. tostring(os.clock())
 if _kpEnv.KP_Runtime and _kpEnv.KP_Runtime.cleanup then
     pcall(_kpEnv.KP_Runtime.cleanup)
@@ -1980,12 +1984,49 @@ end
 local function BindAutoExecute()
     if AutoExecuteBound then return end
     AutoExecuteBound = true
-    TrackConnection(game:GetService("Players").LocalPlayer.OnTeleport:Connect(function()
+    local tearingDown=false
+    local teleportFailed=false
+    local failureConnection
+    local function disconnectFailure()
+        if failureConnection then pcall(function()failureConnection:Disconnect()end);failureConnection=nil end
+        if _kpEnv.KP_TeleportFailureConnection then _kpEnv.KP_TeleportFailureConnection=nil end
+    end
+    local function restoreAfterFailure()
+        if _kpEnv.KP_Runtime~=KP then return end
+        local ok,err=pcall(function()
+            local saved=readfile(KP.runtimeSourcePath)
+            local fn,compileError=loadstring(saved,"KarmaPanda:X teleport recovery")
+            assert(fn,compileError)
+            fn()
+        end)
+        if not ok then KP.Report("Teleport recovery",err) end
+    end
+    TrackConnection(game:GetService("Players").LocalPlayer.OnTeleport:Connect(function(state)
+        if state and state~=Enum.TeleportState.Started then return end
+        if tearingDown then return end
+        tearingDown=true
         KP.flushMacros()
+        if KP.flushMapStats then pcall(KP.flushMapStats)end
         AutoExecuteQueued = false
         if Settings and Settings.auto_execute then
-            task.defer(function() QueueAutoExecute(false) end)
+            local ok,err=pcall(QueueAutoExecute,false)
+            if not ok then KP.Report("Auto Execute queue",err)end
         end
+        local teleportService=game:GetService("TeleportService")
+        local signal=teleportService and teleportService.TeleportInitFailed
+        if signal then
+            failureConnection=signal:Connect(function(player)
+                if player and player~=game:GetService("Players").LocalPlayer then return end
+                teleportFailed=true
+                disconnectFailure()
+                if not KP.alive then nativeTask.defer(restoreAfterFailure)end
+            end)
+            _kpEnv.KP_TeleportFailureConnection=failureConnection
+        end
+        task.defer(function()
+            if KP.alive and not teleportFailed then KP.cleanup()end
+            if teleportFailed then disconnectFailure()end
+        end)
     end))
 end
 
@@ -3214,9 +3255,7 @@ local function GetPriorityRemoteUnit(args)
     end
 end
 -- Observation is the primary path. The optional hook supports old ASTD unit layouts.
-local priorityHookInstalled=false
-local function InstallPriorityHook()
-    if priorityHookInstalled then return true end
+do
     local ok, err = pcall(function()
         if type(getrawmetatable) ~= "function" or type(setreadonly) ~= "function" or type(newcclosure) ~= "function" or type(getnamecallmethod) ~= "function" then return end
         local mt = getrawmetatable(game)
@@ -3242,18 +3281,15 @@ local function InstallPriorityHook()
         setreadonly(mt, false)
         mt.__namecall = hook
         setreadonly(mt, true)
-        priorityHookInstalled=true
         KP.restorePriorityHook = function()
             if mt.__namecall == hook then
                 setreadonly(mt, false)
                 mt.__namecall = original
                 setreadonly(mt, true)
             end
-            priorityHookInstalled=false
         end
     end)
     if not ok then KP.Report("Priority hook unavailable; using replicated priority", err) end
-    return ok and priorityHookInstalled
 end
 
 function StopMacroRecord()
@@ -3261,7 +3297,6 @@ function StopMacroRecord()
     KP.recording = nil
     Settings.macro_record = false
     if recording then KP.CancelContext(recording) end
-    if KP.restorePriorityHook then pcall(KP.restorePriorityHook) end
     KP.flushMacros()
     KP.recordProfile, KP.recordProfileName = nil, nil
     record_connections = {}
@@ -3287,7 +3322,6 @@ function StartMacroRecord()
     Settings.macro_record = true
     local recording = {connections = {}, units = setmetatable({}, {__mode = "k"})}
     KP.recording, KP.recordProfile, KP.recordProfileName = recording, profile, Settings.macro_profile
-    InstallPriorityHook()
     _lastMacroAction, _lastMacroTime = nil, 0
     local running, previous = coroutine.running(), KP.contexts[coroutine.running()]
     local previousOwner = KP.tasks[running]
@@ -8300,6 +8334,7 @@ _importSettingsURL=Bridge.fields["Import Settings URL"].value or ""
 end
 function Bridge.Attach(gui,refresh,notify)
     KP.ui=gui;Bridge.refresh=refresh;ShowNotify=function(title,body)notify(tostring(title)..": "..tostring(body or ""))end
+    BindAutoExecute()
     KP.refreshSettingsUI=refresh;AP.RefreshUI=refresh;KP.UIRefs={}
     for _,item in ipairs(Bridge.items) do if item.settingKey then KP.UIRefs[item.settingKey]={refresh=refresh,setValue=function(v)Bridge.Write(item,v)end} end end
     KP.enemyOverlayFolder=Instance.new("Folder");KP.enemyOverlayFolder.Name="EnemyOverlay";KP.enemyOverlayFolder.Parent=gui;KP.enemyOverlayRefs={}
