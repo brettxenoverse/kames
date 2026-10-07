@@ -3214,7 +3214,9 @@ local function GetPriorityRemoteUnit(args)
     end
 end
 -- Observation is the primary path. The optional hook supports old ASTD unit layouts.
-do
+local priorityHookInstalled=false
+local function InstallPriorityHook()
+    if priorityHookInstalled then return true end
     local ok, err = pcall(function()
         if type(getrawmetatable) ~= "function" or type(setreadonly) ~= "function" or type(newcclosure) ~= "function" or type(getnamecallmethod) ~= "function" then return end
         local mt = getrawmetatable(game)
@@ -3240,15 +3242,18 @@ do
         setreadonly(mt, false)
         mt.__namecall = hook
         setreadonly(mt, true)
+        priorityHookInstalled=true
         KP.restorePriorityHook = function()
             if mt.__namecall == hook then
                 setreadonly(mt, false)
                 mt.__namecall = original
                 setreadonly(mt, true)
             end
+            priorityHookInstalled=false
         end
     end)
     if not ok then KP.Report("Priority hook unavailable; using replicated priority", err) end
+    return ok and priorityHookInstalled
 end
 
 function StopMacroRecord()
@@ -3256,6 +3261,7 @@ function StopMacroRecord()
     KP.recording = nil
     Settings.macro_record = false
     if recording then KP.CancelContext(recording) end
+    if KP.restorePriorityHook then pcall(KP.restorePriorityHook) end
     KP.flushMacros()
     KP.recordProfile, KP.recordProfileName = nil, nil
     record_connections = {}
@@ -3281,6 +3287,7 @@ function StartMacroRecord()
     Settings.macro_record = true
     local recording = {connections = {}, units = setmetatable({}, {__mode = "k"})}
     KP.recording, KP.recordProfile, KP.recordProfileName = recording, profile, Settings.macro_profile
+    InstallPriorityHook()
     _lastMacroAction, _lastMacroTime = nil, 0
     local running, previous = coroutine.running(), KP.contexts[coroutine.running()]
     local previousOwner = KP.tasks[running]
@@ -7606,13 +7613,15 @@ end
 function KP_RenderEnemyOverlay()
     local refs = _kpEnv.KP_Runtime.enemyOverlayRefs
     if not refs then return end
+    if not Settings.show_enemy_overlay then
+        for enemy in pairs(refs) do KP_RemoveEnemyOverlay(enemy) end
+        return
+    end
     local live = {}
     for _, enemy in ipairs(KP_GetOverlayEnemies()) do live[enemy] = true end
     for enemy, _ in pairs(refs) do
         if not live[enemy] or not Settings.show_enemy_overlay then KP_RemoveEnemyOverlay(enemy) end
     end
-    if not Settings.show_enemy_overlay then return end
-
     for _, enemy in ipairs(KP_GetOverlayEnemies()) do
         local adornee = enemy:FindFirstChild("Head") or enemy:FindFirstChild("HumanoidRootPart")
         if adornee then
