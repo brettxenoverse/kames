@@ -4,14 +4,32 @@ local _waitStart = tick()
 repeat task.wait(0.5) until game.GameId == 1720936166 or game.PlaceId == 4996049426 or tick() - _waitStart > 15
 if game.GameId ~= 1720936166 and game.PlaceId ~= 4996049426 then return end
 local _kpEnv = getgenv()
+local _kpStartupDelay = 0
+pcall(function()
+    local player = game:GetService("Players").LocalPlayer
+    local path = "KarmaPanda/ASTD/Settings/" .. tostring(player.UserId) .. ".json"
+    local saved = game:GetService("HttpService"):JSONDecode(readfile(path))
+    local delay = tonumber(saved.script_startup_delay)
+    if delay and delay == delay and math.abs(delay) < math.huge then
+        _kpStartupDelay = math.clamp(delay, 0, 60)
+    end
+end)
+_kpEnv.KP_StartupGeneration = (_kpEnv.KP_StartupGeneration or 0) + 1
+local _kpStartupGeneration = _kpEnv.KP_StartupGeneration
 if _kpEnv.KP_TeleportFailureConnection then
     pcall(function()_kpEnv.KP_TeleportFailureConnection:Disconnect()end)
     _kpEnv.KP_TeleportFailureConnection=nil
 end
-local _kpSessionId = tostring(game.JobId) .. ":" .. tostring(os.clock())
 if _kpEnv.KP_Runtime and _kpEnv.KP_Runtime.cleanup then
     pcall(_kpEnv.KP_Runtime.cleanup)
 end
+local _kpStartupDeadline = os.clock() + _kpStartupDelay
+while _kpStartupDelay > 0 and os.clock() < _kpStartupDeadline do
+    if _kpEnv.KP_StartupGeneration ~= _kpStartupGeneration then return end
+    task.wait(math.min(0.25, _kpStartupDeadline - os.clock()))
+end
+if _kpEnv.KP_StartupGeneration ~= _kpStartupGeneration then return end
+local _kpSessionId = tostring(game.JobId) .. ":" .. tostring(os.clock())
 _kpEnv.KP_Runtime = {
     session = _kpSessionId,
     connections = {},
@@ -24,6 +42,7 @@ _G.KarmaPandaLoaded = true
 -- Session-owned workers: re-execution cancels every task created by this file.
 local KP = _kpEnv.KP_Runtime
 KP.alive = true
+KP.matchReady = false
 KP.tasks = {}
 KP.contexts = setmetatable({}, {__mode = "k"})
 KP.features = {}
@@ -611,7 +630,8 @@ local DefaultSettings = {
     auto_place_units = {},
     macro_keybinds = true,
     mobile_toggle = true,
-    ui_accent="B41E1E", ui_opacity=.96, ui_theme="Crimson", ui_toggle_key="K", ui_state={}
+    ui_accent="B41E1E", ui_opacity=.96, ui_theme="Crimson", ui_toggle_key="K", ui_state={},
+    script_startup_delay=0
 }
 
 function KP.ValidateAutoPlacement(result, legacy)
@@ -727,6 +747,7 @@ function KP.ValidateSettings(value)
     end
     result.macro_playback_search_attempts = math.min(120, math.floor(result.macro_playback_search_attempts))
     result.ui_scale = math.clamp(result.ui_scale, 0.5, 1.5)
+    result.script_startup_delay = math.clamp(result.script_startup_delay, 0, 60)
     result.ui_accent=result.ui_accent:gsub("#",""):upper()
     if not result.ui_accent:match("^%x%x%x%x%x%x$") then result.ui_accent=DefaultSettings.ui_accent end
     result.ui_opacity=math.clamp(result.ui_opacity,.6,1)
@@ -2227,20 +2248,37 @@ function MacroPlacement.AddRestriction(list, instance)
     end
 end
 
+local function VisitDescendants(root, visit, yieldEvery)
+    if not root then return end
+    local stack = root:GetChildren()
+    local processed = 0
+    while #stack > 0 do
+        local instance = table.remove(stack)
+        visit(instance)
+        for _, child in ipairs(instance:GetChildren()) do
+            stack[#stack + 1] = child
+        end
+        processed = processed + 1
+        if yieldEvery and processed % yieldEvery == 0 then task.wait() end
+    end
+end
+
 function MacroPlacement.Refresh()
     local now = tick()
+    local placeable = workspace:FindFirstChild("Placeable")
+    local camera = workspace:FindFirstChild("Camera") or workspace.CurrentCamera
     if now < (MacroPlacement.nextRefresh or 0) and
-        (#MacroPlacement.base > 0 or #MacroPlacement.hill > 0) then
+        MacroPlacement.baseRoot == placeable and MacroPlacement.cameraRoot == camera then
         return
     end
-    MacroPlacement.nextRefresh = now + 2
+    MacroPlacement.nextRefresh = now + 3
+    MacroPlacement.baseRoot, MacroPlacement.cameraRoot = placeable, camera
     MacroPlacement.base = {}
     MacroPlacement.hill = {}
     MacroPlacement.restrictions = {}
 
-    local placeable = workspace:FindFirstChild("Placeable")
     if placeable then
-        for _, desc in ipairs(placeable:GetDescendants()) do
+        VisitDescendants(placeable, function(desc)
             if desc:IsA("BasePart") then
                 local kind = nil
                 local cur = desc
@@ -2260,7 +2298,7 @@ function MacroPlacement.Refresh()
                     table.insert(MacroPlacement.base, desc)
                 end
             end
-        end
+        end, 256)
     end
 
     pcall(function()
@@ -2270,14 +2308,13 @@ function MacroPlacement.Refresh()
         end
     end)
 
-    local camera = workspace:FindFirstChild("Camera") or workspace.CurrentCamera
     if camera then
-        for _, desc in ipairs(camera:GetDescendants()) do
+        VisitDescendants(camera, function(desc)
             local name = string.lower(tostring(desc.Name))
             if name:find("restriction", 1, true) then
                 MacroPlacement.AddRestriction(MacroPlacement.restrictions, desc)
             end
-        end
+        end, 256)
     end
 end
 
@@ -6400,7 +6437,14 @@ function AP.MapKey()
     if is_lobby() then return "lobby:defaults" end
     local stage = game.ReplicatedStorage:FindFirstChild("STORYMODE_VALUE")
     if stage and tonumber(stage.Value) then return tostring(game.PlaceId) .. ":" .. tostring(stage.Value) end
-    return tostring(game.PlaceId) .. ":session:" .. tostring(game.JobId)
+    local map=workspace:FindFirstChild("Map")
+    local identity="unknown"
+    if map then
+        local ok,value=pcall(function()return map:GetAttribute("MapId") or map:GetAttribute("MapName") or map.Name end)
+        if ok and value~=nil and tostring(value)~="" then identity=tostring(value) end
+    end
+    identity=identity:lower():gsub("[^%w%-_]+","_"):sub(1,100)
+    return tostring(game.PlaceId) .. ":map:" .. identity
 end
 function AP.Zones()
     Settings.auto_place_maps=Settings.auto_place_maps or {}
@@ -6419,7 +6463,28 @@ function AP.Zones()
     local zones=Settings.auto_place_maps[key]
     if not zones then
         zones={}
-        if Settings.auto_place_map==key and #(Settings.auto_place_zones or {})>0 then
+        local previousKey=Settings.auto_place_map
+        local placePrefix=tostring(game.PlaceId)..":"
+        local samePlace=type(previousKey)=="string" and previousKey~=key and previousKey:sub(1,#placePrefix)==placePrefix
+        local previousTemporary= samePlace and (previousKey:find(":session:",1,true) or previousKey:find(":map:",1,true))
+        local currentTemporary=key:find(":map:",1,true)~=nil
+        local canMigrate=samePlace and (previousTemporary or currentTemporary)
+        local previousZones=canMigrate and (Settings.auto_place_maps[previousKey] or (Settings.auto_place_map==previousKey and Settings.auto_place_zones))
+        if previousZones then
+            zones=DeepCopy(previousZones)
+            if currentTemporary and not previousTemporary then
+                -- Keep the last known sizes while map identity replicates, but don't
+                -- apply another mode's saved coordinates to an unidentified map.
+                for _,zone in ipairs(zones)do
+                    zone.x,zone.y,zone.z=0,0,0
+                    zone.placed,zone.manual=false,false
+                    zone.entranceX,zone.entranceZ=nil,nil
+                end
+            end
+            Settings.auto_place_maps[key]=zones
+            if Settings.auto_place_map_custom[previousKey] then Settings.auto_place_map_custom[key]=true end
+            AP.migratedMapKey=key
+        elseif Settings.auto_place_map==key and #(Settings.auto_place_zones or {})>0 then
             for index,old in ipairs(Settings.auto_place_zones) do
                 if index<=4 then zones[index]=DeepCopy(old);zones[index].placed=old.placed~=false;zones[index].manual=old.manual~=false end
             end
@@ -7185,10 +7250,11 @@ function AP.Zones()
     local key=AP.MapKey()
     local saved=Settings.auto_place_maps and Settings.auto_place_maps["lobby:defaults"]
     local existed=Settings.auto_place_maps and Settings.auto_place_maps[key]
+    local migrated=AP.migratedMapKey==key
     if is_lobby()and saved then AP.lobbyZones=saved end
     local zones=zonesBeforeRepair()
     if is_lobby()then Settings.auto_place_maps["lobby:defaults"]=zones
-    elseif not existed and saved then
+    elseif not existed and not migrated and saved then
         for index,zone in ipairs(zones)do if not zone.manual and saved[index]then zone.size=saved[index].size end end
     end
     return zones
@@ -7292,31 +7358,48 @@ function AP.Surface(name,config)
 end
 function AP.PlacementParts(surface)
     local root=workspace:FindFirstChild("Placeable")
+    while AP.partsScanning do task.wait(0.05)end
     if AP.partsRoot==root and AP.partsCache and tick()<(AP.partsExpires or 0)and AP.partsCache[surface]then
         local valid=true
         for _,part in ipairs(AP.partsCache[surface])do if not part.Parent then valid=false;break end end
         if valid then return AP.partsCache[surface]end
         AP.partsExpires=0
     end
-    if AP.partsRoot~=root or tick()>=(AP.partsExpires or 0)then AP.partsRoot=root;AP.partsCache={};AP.partsExpires=tick()+1 end
+    if AP.partsRoot~=root or tick()>=(AP.partsExpires or 0)then
+        AP.partsRoot=root;AP.partsCache={}
+        local ok,touchEnabled=pcall(function()return game:GetService("UserInputService").TouchEnabled end)
+        AP.partsExpires=tick()+(ok and touchEnabled and 4 or 3)
+    end
     local result,seen={},{}
     local function add(part,kind)
         if part and part.Parent and not seen[part]and (surface=="Hybrid"or surface==kind)then seen[part]=true;table.insert(result,part)end
     end
-    for _,part in ipairs(MacroPlacement.base)do add(part,"Ground")end
-    for _,part in ipairs(MacroPlacement.hill)do add(part,"Hill")end
-    if root then
-        local all=root:GetDescendants();if root:IsA("BasePart")then table.insert(all,root)end
-        for _,part in ipairs(all)do if part:IsA("BasePart")then
-            local node,kind=part,"Ground"
-            while node and node~=root do
-                local name=node.Name:lower()
-                if name:find("hill",1,true)or name:find("air",1,true)then kind="Hill";break end
-                node=node.Parent
+    AP.partsScanning=true
+    local scanOk,scanError=pcall(function()
+        for _,part in ipairs(MacroPlacement.base)do add(part,"Ground")end
+        for _,part in ipairs(MacroPlacement.hill)do add(part,"Hill")end
+        if root then
+            if root:IsA("BasePart")then add(root,"Ground")end
+            local stack=root:GetChildren();local processed=0
+            while #stack>0 do
+                local part=table.remove(stack)
+                for _,child in ipairs(part:GetChildren())do stack[#stack+1]=child end
+                if part:IsA("BasePart")then
+                    local node,kind=part,"Ground"
+                    while node and node~=root do
+                        local name=node.Name:lower()
+                        if name:find("hill",1,true)or name:find("air",1,true)then kind="Hill";break end
+                        node=node.Parent
+                    end
+                    add(part,kind)
+                end
+                processed=processed+1
+                if processed%256==0 then task.wait()end
             end
-            add(part,kind)
-        end end
-    end
+        end
+    end)
+    AP.partsScanning=false
+    if not scanOk then error(scanError)end
     AP.partsCache=AP.partsCache or {};AP.partsCache[surface]=result
     return result
 end
@@ -7392,7 +7475,7 @@ end
 -- Discover late-loading lanes and rebuild previews even when placement is off.
 task.spawn(function()
     while ScriptAlive()do
-        if not is_lobby()and (Settings.auto_place_show_zones or Settings.auto_place)then
+        if KP.matchReady and not is_lobby()and (Settings.auto_place_show_zones or Settings.auto_place)then
             local map=AP.MapKey()
             if map~=AP.previewMap then
                 AP.previewMap=map;AP.previewScan=0
@@ -7400,7 +7483,8 @@ task.spawn(function()
                 AP.Changed()
             end
             if tick()>=(AP.previewScan or 0)then
-                AP.previewScan=tick()+2
+                local ok,touchEnabled=pcall(function()return game:GetService("UserInputService").TouchEnabled end)
+                AP.previewScan=tick()+(ok and touchEnabled and 6 or 2)
                 if AP.NeedsZones()or AP.zoneAuditRevision~=AP.revision or AP.routeScanMap~=map then AP.AutoZones();AP.routeScanMap=map end
                 local parent=workspace.CurrentCamera or workspace
                 if Settings.auto_place_show_zones and (not AP.folder or AP.folder.Parent~=parent)then AP.Render()end
@@ -7548,9 +7632,30 @@ end
 if get_world() ~= -1 and get_world() ~= -2 then
     local lobbyFlag = game.ReplicatedStorage:WaitForChild("Lobby", 30)
     if not lobbyFlag then error("ASTD Lobby state did not load. Please re-execute after loading.") end
-    local loading = GUI:FindFirstChild("LoadingScreen")
-    local loadingFrame = loading and loading:FindFirstChild("Frame")
-    while loadingFrame and loadingFrame.Parent and loadingFrame.Visible and ScriptAlive() do task.wait(0.1) end
+    local function WaitForMatchReady()
+        if is_lobby() then return true end
+        local readyDeadline=tick()+45
+        local stableSince=nil
+        local ok,touchEnabled=pcall(function()return game:GetService("UserInputService").TouchEnabled end)
+        local settleTime=ok and touchEnabled and 1.5 or 0.75
+        repeat
+            if not ScriptAlive() then return false end
+            local loading=GUI:FindFirstChild("LoadingScreen")
+            local frame=loading and loading:FindFirstChild("Frame")
+            if frame and frame.Visible then
+                stableSince=nil
+            elseif GUI:FindFirstChild("HUD") or workspace:FindFirstChild("Map") then
+                stableSince=stableSince or tick()
+                if tick()-stableSince>=settleTime then return true end
+            else
+                stableSince=nil
+            end
+            task.wait(0.25)
+        until tick()>=readyDeadline
+        return ScriptAlive()
+    end
+    if not WaitForMatchReady() then return end
+    KP.matchReady=true
 
     if not is_lobby() then
 
@@ -8044,6 +8149,7 @@ Bridge.keys={["Auto Ability"]="auto_buff",
 ["Auto Placement"]="auto_place",
 ["Show Zones"]="auto_place_show_zones",
 ["Auto Execute"]="auto_execute",
+["Script Startup Delay"]="script_startup_delay",
 ["Enemy Overlay"]="show_enemy_overlay",
 ["Close UI On Execution"]="close_on_injection",
 ["Mobile Toggle Button"]="mobile_toggle",
@@ -8723,6 +8829,7 @@ local Pages = {{name = "Home", icon = "⌂", tabs = {{name = "", cards = {{title
                                     "Right Control"}, value = "K"},
                             {type = "toggle", label = "UI Keybinds", value = true},
                             {type = "toggle", label = "Auto Execute", value = false},
+                            {type = "slider", label = "Script Startup Delay", value = 0, min = 0, max = 60, step = 1, suffix = " s"},
                             {type = "button", label = "Reset UI Position", accent = false},
                             {type = "button", label = "Reset Settings To Default", accent = false}}},
                     {title = "About", icon = "◇", items = {{type = "credits", label = "script by blob · base by KarmaPanda"}}}}}}}}
